@@ -2,8 +2,9 @@ import Block from '../blockchain/block';
 import Config from '../config/main';
 import Constant from '../constant';
 import DB from '../platform/db';
-import Redis from '../redis';
+import Redis from '../platform/redis';
 import Helpers from '../util/helpers';
+import logger from '../util/logger';
 
 class BlockSave {
   public static buildUnspentKey(address, output) {
@@ -41,7 +42,8 @@ class BlockSave {
 
   private blockchainDB;
   private utxoDB;
-  private redis;
+  private redis: Redis;
+  private natsServerState: 0 | 1 = 0;
 
   public constructor() {
     this.initDBs();
@@ -58,8 +60,11 @@ class BlockSave {
     this.utxoDB = new DB(Config.UTXO_DATABASE, options);
   }
 
-  public init() {
+  public async init(): Promise<void> {
+    await this.redis.init();
     process.on('message', this.messageHandler.bind(this));
+
+    process.send({ type: 'worker_init' });
   }
 
   public async messageHandler(msg) {
@@ -107,7 +112,7 @@ class BlockSave {
 
       if (tx.type === 'regular' || block.index === 0) {
         if (length - i <= Config.TX_PER_PAGE) {
-          this.redis.pushTransactionCommand(tx);
+          this.redis.pushCommandByKey(JSON.stringify(tx), Config.REDIS_TX_CACHE)
         }
 
         totalMoneyTransferredInBlock += tx.txOuts[0].amount;
@@ -116,8 +121,6 @@ class BlockSave {
         this.populateSpentInputs(tx.txIns, spentInputs, preparedData);
       }
     }
-
-    this.redis.pushTransactionTrimCommand();
 
     if (length > 1) {
       for (const item in unspentInputs) {
@@ -148,6 +151,8 @@ class BlockSave {
         statKey,
         Buffer.from(JSON.stringify(stat))
       ]);
+
+      this.redis.pushTrimCommand(Config.REDIS_TX_CACHE, Config.TX_PER_PAGE - 1);
     }
 
     blockchainTxn.abort();
@@ -243,12 +248,20 @@ class BlockSave {
         this._saveUtxoData(preparedData.utxoData)
       ])
         .then(() => {
-          this.redis.pushBlockCommand(blockHeader);
-          this.redis.pushBlockTrimCommand();
+          this.redis.pushCommandByKey(blockHeader, Config.REDIS_BLOCK_CACHE);
+          this.redis.pushTrimCommand(Config.REDIS_BLOCK_CACHE, Config.BLOCKS_PER_PAGE - 1);
+
+          if (process.env.NODE_ENV === 'dev') {
+            logger.info(`Block info: ${blockHeader}`);
+          }
 
           resolve(true);
         })
         .catch((error) => {
+          if (process.env.NODE_ENV === 'dev') {
+            logger.warn(`Block info: ${blockHeader}`);
+          }
+          
           reject(error);
         });
     });
@@ -302,4 +315,6 @@ class BlockSave {
 
 const blockSave = new BlockSave();
 
-blockSave.init();
+blockSave.init().catch((error) => {
+  logger.error(error);
+});

@@ -8,6 +8,7 @@ import Blockchain from './blockchain';
 import Config from './config/main';
 import HttpServer from './httpServer';
 import Node from './node';
+import Redis from './platform/redis';
 import Wallet from './wallet';
 import Queue from './util/queue';
 import Backup from './util/backup';
@@ -22,8 +23,14 @@ import logger from './util/logger';
 
     await queue.emptyQueue();
 
+    const redis = new Redis();
+    await redis.init();
+
     const emitter = new EventEmitter();
-    const blockchain = new Blockchain(emitter, queue);
+
+    const blockchain = new Blockchain(emitter, queue, redis);
+    await blockchain.init();
+
     const wallet = new Wallet(blockchain);
     const node = new Node(emitter, blockchain, queue);
     const server = new HttpServer(blockchain, wallet, node);

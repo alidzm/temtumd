@@ -77,4 +77,8 @@ export default class Queue extends EventEmitter {
   public process(callback): void {
     this.queue.process(callback);
   }
+
+  public async count(): Promise<number> {
+    return await this.queue.count();
+  }
 }

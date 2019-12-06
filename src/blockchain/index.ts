@@ -1,11 +1,14 @@
 import { fork } from 'child_process';
+import { EventEmitter } from 'events';
 import * as path from 'path';
+import * as fs from 'fs';
 
 import Config from '../config/main';
 import Constant from '../constant';
 import { CustomBlock, BlockHeader, RawTx, Stat } from '../interfaces';
 import DB from '../platform/db';
-import Redis from '../redis';
+import Redis from '../platform/redis';
+import Queue from '../util/queue';
 import Helpers from '../util/helpers';
 import logger from '../util/logger';
 import Block from './block';
@@ -113,26 +116,62 @@ class Blockchain {
   public blockQueue = {};
   public hasGenesis = false;
 
-  private readonly emitter;
-  private queue;
-  private redis;
+  private readonly emitter: EventEmitter;
+  private readonly queue: Queue;
+  private readonly redis: Redis;
 
-  public constructor(emitter, queue) {
+  public constructor(emitter, queue, redis) {
     this.emitter = emitter;
     this.queue = queue;
-    this.redis = new Redis();
+    this.redis = redis;
 
     this.initDBs();
-    this.initWorker();
     this.blockSaveHandler();
   }
 
-  public initWorker(): void {
-    this.worker = fork(path.join(process.cwd(), 'src/workers/save.js'));
+  public async initWorker(): Promise<void> {
+    const workerPath = path.join(process.cwd(), 'src/workers/');
+    const workerLockPath = workerPath + 'save.lock';
+
+    await this.checkAndKillWorker(workerLockPath);
+
+    this.worker = fork(workerPath + 'save.js');
+    fs.writeFileSync(workerLockPath, Buffer.from(this.worker.pid.toString()));
 
     this.worker.on('message', (msg): void => {
       this.saveWorkerMessageHandler(msg);
     });
+
+    await this.onWorkerInit();
+  }
+
+  private killWorker(workerLockPath: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      try {
+        const pid = fs.readFileSync(workerLockPath, 'utf8');
+        process.kill(parseInt(pid));
+      } catch (e) {}
+
+      resolve(true);
+    });
+  }
+
+  private checkWorkerLock(workerLockPath: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const interval = setInterval(() =>{
+        try {
+          fs.accessSync(workerLockPath);
+        } catch (e) {
+          clearInterval(interval);
+          resolve(true);
+        }
+      }, 1000);
+    });
+  }
+
+  private async checkAndKillWorker(workerLockPath: string): Promise<void> {
+    await this.killWorker(workerLockPath);
+    await this.checkWorkerLock(workerLockPath);
   }
 
   public initDBs(): void {
@@ -183,7 +222,7 @@ class Blockchain {
     ]);
     const pages = Math.ceil(count / Number(Config.BLOCKS_PER_PAGE));
     const pos = Blockchain.calcEndPagePos(start, count, Config.BLOCKS_PER_PAGE);
-    const blockHash = await this.redis.getBlockCache();
+    const blockHash = await this.redis.getRedisList(Config.REDIS_BLOCK_CACHE);
 
     if (offset === 0 && blockHash.length >= pos) {
       cursor.close();
@@ -558,7 +597,7 @@ class Blockchain {
     });
   }
 
-  public getUnspentOutputsByAddress(address): TxIn[] {
+  public getUnspentOutputsByAddress(address, useLimit = true): TxIn[] {
     const utxo = [];
     const shortAddress = Helpers.toShortAddress(address);
     const unspentKey = Buffer.from(
@@ -566,11 +605,17 @@ class Blockchain {
     );
     const cursor = this.utxoDB.initCursor(this.utxoReader);
 
+    let txCounter = 0;
+
     for (
       let found = cursor.goToRange(unspentKey);
       found !== null;
       found = cursor.goToNext()
     ) {
+      if (useLimit && txCounter >= Config.UTXO_LIMIT) {
+        break;
+      }
+
       if (Buffer.compare(unspentKey, found.slice(0, unspentKey.length))) {
         break;
       }
@@ -591,6 +636,8 @@ class Blockchain {
       );
 
       utxo.push(input);
+
+      txCounter++;
     }
 
     cursor.close();
@@ -638,7 +685,9 @@ class Blockchain {
    * @returns {Object} {transactionList: Transaction[]}
    */
   public async getLastTransactionList(): Promise<object> {
-    const transactionList = await this.redis.getTransactionCache();
+    const transactionList = await this.redis.getRedisList(
+      Config.REDIS_TX_CACHE
+    );
 
     return { transactionList };
   }
@@ -665,6 +714,9 @@ class Blockchain {
     switch (msg.type) {
       case 'saved':
         this.emitter.emit('block_added_to_chain');
+        break;
+      case 'worker_init':
+        this.emitter.emit('worker_init');
         break;
     }
   }
@@ -695,7 +747,7 @@ class Blockchain {
   }
 
   public getBalanceForAddress(address): number {
-    const utxo = this.getUnspentOutputsByAddress(address);
+    const utxo = this.getUnspentOutputsByAddress(address, false);
 
     return Helpers.sumArrayObjects(utxo, 'amount');
   }
@@ -822,6 +874,136 @@ class Blockchain {
         logger.error(error);
       }
     }
+  }
+
+  private onWorkerInit(): Promise<void> {
+    return new Promise((resolve): void => {
+      const handler = (): void => {
+        resolve();
+      };
+
+      this.emitter.once('worker_init', handler);
+    });
+  }
+
+  public async init(): Promise<void> {
+    const lastBlockIndex = await this.getLastBlockIndex();
+
+    await this.initWorker();
+
+    if (lastBlockIndex) {
+      const blockCache = await this.redis.getRedisList(
+        Config.REDIS_BLOCK_CACHE
+      );
+      const transactionCache = await this.redis.getRedisList(
+        Config.REDIS_TX_CACHE
+      );
+
+      if (!blockCache.length) {
+        await this.updateBlockCache();
+      }
+
+      if (!transactionCache.length) {
+        await this.updateTransactionCache();
+      }
+    }
+  }
+
+  public async updateBlockCache(): Promise<void> {
+    const prefix = Buffer.from(Constant.CHAIN_PREFIX);
+    const cursor = this.blockchainDB.initCursor(this.blockchainReader);
+
+    cursor.goToRange(this.getLastKey(prefix));
+
+    const lastKey = cursor.goToPrev();
+
+    if (!lastKey) {
+      cursor.close();
+
+      return;
+    }
+
+    const count = Helpers.readVarInt(lastKey.slice(prefix.length)).value + 1;
+    const startKey = Buffer.concat([prefix, Helpers.writeVarInt(count)]);
+    const end = count > Config.BLOCKS_PER_PAGE ? Config.BLOCKS_PER_PAGE : count;
+
+    cursor.goToRange(startKey);
+
+    for (let i = 0; i < end; i++) {
+      const key = this.blockchainDB.get(
+        this.blockchainReader,
+        cursor.goToPrev()
+      );
+      const block = await this.getBlockByHash(key);
+
+      if (block) {
+        this.redis.pushCommandByKey(
+          JSON.stringify(block),
+          Config.REDIS_BLOCK_CACHE,
+          'rpush'
+        );
+      }
+    }
+
+    cursor.close();
+
+    await this.redis.executeCommands();
+  }
+
+  public async updateTransactionCache(): Promise<void> {
+    const prefix = Buffer.from(Constant.CHAIN_PREFIX);
+    const cursor = this.blockchainDB.initCursor(this.blockchainReader);
+
+    cursor.goToRange(this.getLastKey(prefix));
+
+    const lastKey = cursor.goToPrev();
+
+    if (!lastKey) {
+      cursor.close();
+
+      return;
+    }
+
+    const end = Helpers.readVarInt(lastKey.slice(prefix.length)).value + 1;
+    const startKey = Buffer.concat([prefix, Helpers.writeVarInt(end)]);
+    let txCounter = 0;
+
+    cursor.goToRange(startKey);
+
+    for (let i = 0; i < end; i++) {
+      const key = this.blockchainDB.get(
+        this.blockchainReader,
+        cursor.goToPrev()
+      );
+      const block: BlockHeader = await this.getBlockByHash(key);
+
+      if (block && block.txCount > 1) {
+        const data: Buffer = this.getBlockTxs(key);
+        const txs = await Helpers.decompressData(data, 'array');
+
+        for (let j = block.txCount - 1; j > 0; j--) {
+          const tx = txs[j];
+
+          if (tx.type === 'regular' || block.index === 0) {
+            this.redis.pushCommandByKey(
+              JSON.stringify(tx),
+              Config.REDIS_TX_CACHE,
+              'rpush'
+            );
+            txCounter++;
+
+            if (txCounter === Config.TX_PER_PAGE) {
+              i = end;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    cursor.close();
+
+    await this.redis.executeCommands();
   }
 }
 

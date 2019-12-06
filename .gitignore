@@ -3,6 +3,7 @@ doc
 out
 node_modules
 npm-debug.log
+save.lock
 .idea
 .env
 .srl
