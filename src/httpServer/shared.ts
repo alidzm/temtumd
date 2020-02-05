@@ -9,7 +9,7 @@ export default class Shared {
   public static sendTransaction(txHex) {
     return new Promise((resolve, reject) => {
       axios
-        .post(`${process.env.TRANSACTIONS_POOL}/transaction/send`, {
+        .post(`${process.env.PUBLISH_SERVER}/transaction/send`, {
           txHex
         })
         .then((res) => {

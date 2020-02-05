@@ -1,3 +1,6 @@
+import * as fs from 'fs';
+import * as path from 'path';
+
 import Block from '../blockchain/block';
 import Config from '../config/main';
 import Constant from '../constant';
@@ -64,6 +67,9 @@ class BlockSave {
     await this.redis.init();
     process.on('message', this.messageHandler.bind(this));
 
+    process.on('SIGTERM', this.removeLockFile);
+    process.on('SIGINT', this.removeLockFile);
+
     process.send({ type: 'worker_init' });
   }
 
@@ -112,7 +118,10 @@ class BlockSave {
 
       if (tx.type === 'regular' || block.index === 0) {
         if (length - i <= Config.TX_PER_PAGE) {
-          this.redis.pushCommandByKey(JSON.stringify(tx), Config.REDIS_TX_CACHE)
+          this.redis.pushCommandByKey(
+            JSON.stringify(tx),
+            Config.REDIS_TX_CACHE
+          );
         }
 
         totalMoneyTransferredInBlock += tx.txOuts[0].amount;
@@ -249,7 +258,10 @@ class BlockSave {
       ])
         .then(() => {
           this.redis.pushCommandByKey(blockHeader, Config.REDIS_BLOCK_CACHE);
-          this.redis.pushTrimCommand(Config.REDIS_BLOCK_CACHE, Config.BLOCKS_PER_PAGE - 1);
+          this.redis.pushTrimCommand(
+            Config.REDIS_BLOCK_CACHE,
+            Config.BLOCKS_PER_PAGE - 1
+          );
 
           if (process.env.NODE_ENV === 'dev') {
             logger.info(`Block info: ${blockHeader}`);
@@ -261,7 +273,7 @@ class BlockSave {
           if (process.env.NODE_ENV === 'dev') {
             logger.warn(`Block info: ${blockHeader}`);
           }
-          
+
           reject(error);
         });
     });
@@ -310,6 +322,11 @@ class BlockSave {
     ]);
 
     return this.blockchainDB.get(txn, key);
+  }
+
+  private removeLockFile() {
+    fs.unlinkSync(path.join(process.cwd(), 'src/workers/save.lock'));
+    process.exit(0);
   }
 }
 
